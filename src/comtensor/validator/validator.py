@@ -40,6 +40,7 @@ from jellyfish import jaro_winkler_similarity
 
 from ._config import ValidatorSettings
 from ..utils import log
+from .security import SecurityManager, RateLimiter
 
 IP_REGEX = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+")
 
@@ -198,6 +199,8 @@ class TextValidator(Module):
         netuid: The unique identifier of the subnet.
         val_model: The validation model used for scoring answers.
         call_timeout: The timeout value for module calls in seconds (default: 60).
+        security_manager: The security manager for security checks.
+        rate_limiter: The rate limiter for rate limiting requests.
 
     Methods:
         get_modules: Retrieve all module addresses from the subnet.
@@ -221,6 +224,8 @@ class TextValidator(Module):
         self.netuid = netuid
         self.val_model = "foo"
         self.call_timeout = call_timeout
+        self.security_manager = SecurityManager()
+        self.rate_limiter = RateLimiter()
 
     def get_addresses(self, client: CommuneClient, netuid: int) -> dict[int, str]:
         """
@@ -238,35 +243,134 @@ class TextValidator(Module):
         module_addreses = client.query_map_address(netuid)
         return module_addreses
 
+    async def validate_step(
+        self, comtensor_netuid: int, settings: ValidatorSettings
+    ) -> None:
+        """Perform a validation step with security checks."""
+        try:
+            # Get miner information
+            modules_addresses = self.get_addresses(self.client, comtensor_netuid)
+            modules_keys = self.client.query_map_key(comtensor_netuid)
+            val_ss58 = self.key.ss58_address
+
+            # Verify validator registration
+            if val_ss58 not in modules_keys.values():
+                raise RuntimeError(f"validator key {val_ss58} is not registered in subnet")
+
+            # Prepare miner information with security checks
+            modules_info: dict[int, tuple[list[str], Ss58Address]] = {}
+            modules_filtered_address = get_ip_port(modules_addresses)
+
+            for module_id in modules_keys.keys():
+                module_addr = modules_filtered_address.get(module_id, None)
+                if not module_addr:
+                    continue
+
+                # Check rate limiting
+                is_limited, reason = self.rate_limiter.is_rate_limited(module_addr[0])
+                if is_limited:
+                    log(f"Rate limited miner {module_id}: {reason}")
+                    continue
+
+                # Generate nonce for this miner
+                nonce = self.security_manager.generate_nonce()
+                modules_info[module_id] = (module_addr, modules_keys[module_id], nonce)
+
+            if not modules_info:
+                log("No valid miners available for validation")
+                return None
+
+            score_dict: dict[int, float] = {}
+            miner_prompt = self.get_miner_prompt()
+
+            # Process miners in parallel with security checks
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = []
+                for module_id, (addr, key, nonce) in modules_info.items():
+                    future = executor.submit(
+                        self._get_miner_prediction,
+                        miner_prompt,
+                        (addr, key),
+                        nonce
+                    )
+                    futures.append((module_id, future))
+
+                miner_answers = []
+                for module_id, future in futures:
+                    try:
+                        response = future.result(timeout=self.call_timeout)
+                        if response and self._verify_miner_response(module_id, response, modules_info[module_id][2]):
+                            miner_answers.append((module_id, response))
+                    except Exception as e:
+                        log(f"Error processing miner {module_id}: {e}")
+
+            if not miner_answers:
+                log("No valid responses from miners")
+                return None
+
+            # Score miners
+            miner_res, miner_time, miner_uids = [], [], []
+            for uid, miner_response in miner_answers:
+                miner_res.append(miner_response["response"])
+                miner_time.append(miner_response["response_time"])
+                miner_uids.append(uid)
+
+            score_dict = self._score_miner(miner_res, miner_uids, miner_time)
+
+            if not score_dict:
+                log("No miner managed to give a valid answer")
+                return None
+
+            # Set weights with security checks
+            _ = set_weights(settings, score_dict, self.netuid, self.client, self.key)
+
+        except Exception as e:
+            log(f"Error in validation step: {e}")
+            return None
+
+    def _verify_miner_response(self, module_id: int, response: dict, nonce: str) -> bool:
+        """Verify miner's response signature and nonce."""
+        try:
+            if "signature" not in response or "nonce" not in response:
+                return False
+            return (
+                response["nonce"] == nonce and
+                self.security_manager.verify_signature(
+                    f"{module_id}{nonce}",
+                    response["signature"],
+                    response.get("hotkey", "")
+                )
+            )
+        except Exception as e:
+            log(f"Error verifying miner response: {e}")
+            return False
+
     def _get_miner_prediction(
         self,
         question: str,
         miner_info: tuple[list[str], Ss58Address],
-    ) -> str | None:
-        """
-        Prompt a miner module to generate an answer to the given question.
-
-        Args:
-            question: The question to ask the miner module.
-            miner_info: A tuple containing the miner's connection information and key.
-
-        Returns:
-            The generated answer from the miner module, or None if the miner fails to generate an answer.
-        """
+        nonce: str
+    ) -> dict | None:
+        """Get prediction from miner with security measures."""
         connection, miner_key = miner_info
         module_ip, module_port = connection
         client = ModuleClient(module_ip, int(module_port), self.key)
         uid = self.client.get_uids(miner_key, self.netuid)
+        
         log(f"--->⛏️ UID:{uid} {miner_info}")
         try:
-            # handles the communication with the miner
             start_time = time.time()
             miner_answer = asyncio.run(
                 client.call(
                     "generate",
                     miner_key,
-                    {"prompt": question, "type": "prompt", "netuid": 18},
-                    timeout=self.call_timeout,  #  type: ignore
+                    {
+                        "prompt": question,
+                        "type": "prompt",
+                        "netuid": 18,
+                        "nonce": nonce
+                    },
+                    timeout=self.call_timeout,
                 )
             )
             miner_answer = miner_answer["answer"]
@@ -276,11 +380,10 @@ class TextValidator(Module):
             log(f"<---✅ UID:{uid} {miner_info}")
 
         except Exception as e:
-            log(
-                f"<---❌ Miner UID:{uid} {module_ip}:{module_port} failed to generate an answer"
-            )
+            log(f"<---❌ Miner UID:{uid} {module_ip}:{module_port} failed to generate an answer")
             print(e)
             miner_answer = None
+
         return miner_answer
 
     def calculate_jaro_winkler_scores(self, strings):
@@ -365,66 +468,6 @@ class TextValidator(Module):
         for i, document in enumerate(data_reader()):
             if random_number < i:
                 return document.text
-
-    async def validate_step(
-        self, comtensor_netuid: int, settings: ValidatorSettings
-    ) -> None:
-        """
-        Perform a validation step.
-
-        Generates questions based on the provided settings, prompts modules to generate answers,
-        and scores the generated answers against the validator's own answers.
-
-        Args:
-            comtensor_netuid: The network UID of the subnet.
-        """
-
-        # retrive the miner information
-        modules_adresses = self.get_addresses(self.client, comtensor_netuid)
-        modules_keys = self.client.query_map_key(comtensor_netuid)
-        val_ss58 = self.key.ss58_address
-        if val_ss58 not in modules_keys.values():
-            raise RuntimeError(f"validator key {val_ss58} is not registered in subnet")
-
-        modules_info: dict[int, tuple[list[str], Ss58Address]] = {}
-
-        modules_filtered_address = get_ip_port(modules_adresses)
-        for module_id in modules_keys.keys():
-            module_addr = modules_filtered_address.get(module_id, None)
-            if not module_addr:
-                continue
-            modules_info[module_id] = (module_addr, modules_keys[module_id])
-
-        score_dict: dict[int, float] = {}
-
-        miner_prompt = self.get_miner_prompt()
-        get_miner_prediction = partial(self._get_miner_prediction, miner_prompt)
-
-        log(f"Selected the following miners: {modules_info.keys()}")
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            it = executor.map(get_miner_prediction, modules_info.values())
-            miner_answers = [*it]
-
-        miner_res, miner_time, miner_uids = [], [], []
-        for uid, miner_response in zip(modules_info.keys(), miner_answers):
-            miner_answer = miner_response
-            if not miner_answer:
-                log(f"Skipping miner {uid} that didn't answer")
-                continue
-
-            miner_res.append(miner_response["response"])
-            miner_time.append(miner_response["response_time"])
-            miner_uids.append(uid)
-
-        score_dict = self._score_miner(miner_res, miner_uids, miner_time)
-
-        if not score_dict:
-            log("No miner managed to give a valid answer")
-            return None
-
-        # the blockchain call to set the weights
-        _ = set_weights(settings, score_dict, self.netuid, self.client, self.key)
 
     def validation_loop(self, settings: ValidatorSettings) -> None:
         """
